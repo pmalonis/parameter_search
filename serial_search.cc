@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <functional>
 #include <numeric>
+#include <mpi.h>
 #include <gsl/gsl_interp.h>
 #include <gsl/gsl_errno.h>
 #include <gsl/gsl_matrix.h>
@@ -17,7 +18,7 @@
 double sum_array(double* array,int n){
     int i;
     double result=0;
-    for (i=0;i<n;i++){
+    for (i=0;i<n;i++) {
         result += array[i];
     }
     return result;
@@ -611,8 +612,7 @@ jacobian(double t, const double y[], double *dfdy,
    
 }
 
-int
-main(void)
+int main(int argc, char** argv)
 {
     //FILE *fp;
     //fp = fopen("/home/pmalonis/parameter_fitting/test.txt","w");
@@ -639,10 +639,10 @@ main(void)
     int i = 0;
     if (myfile.is_open()) {
         while ( getline (myfile,line)) {
-            std::string::size_type sz; 
-            current_recorded[i] = std::stof(line, &sz);
+            //std::string::size_type sz; 
+            int *ptr = NULL;
+            current_recorded[i] = std::strtod(line.c_str(), ptr);
             i++;
-            
         }
     }
     else std::cout << "Unable to open file"; 
@@ -660,10 +660,9 @@ main(void)
     accelerator =  gsl_interp_accel_alloc();
 
     double param_min_array[] = {450, 70};
-    double param_max_array[] = {500,85};
-    double param_step_array[] = {10,5};
+    double param_max_array[] = {500, 85};
+    double param_step_array[] = {10, 5};
     int nparams = sizeof(param_min_array)/sizeof(double);
-    printf("%d\n", nparams);
     std::vector<double> param_min (param_min_array, 
                                    param_min_array + nparams); 
     std::vector<double> param_max (param_max_array, 
@@ -671,44 +670,56 @@ main(void)
     std::vector<double> param_step (param_step_array, 
                                     param_step_array + nparams);
     std::vector<int> ones (param_min.size(), 1);
-    std::vector<double> nsteps;
+    std::vector<int> nsteps;
+    std::vector<int> divisors;
+    int j;
+    divisors.push_back(1);
     for (i = 0; i < nparams; i++) {
-        printf("max: %f\n", param_max[i]);
-        printf("min: %f\n", param_min[i]);
-        printf("%f\n", 1 + (param_max[i] - param_min[i])/param_step[i]);
-        nsteps.push_back(1 + (param_max[i] - param_min[i])/param_step[i]);
+        //printf("max: %f\n", param_max[i]);
+        //printf("min: %f\n", param_min[i]);
+        //printf("%f\n", 1 + (param_max[i] - param_min[i])/param_step[i]);
+        nsteps.push_back(static_cast<int>(1 + (param_max[i] - 
+                                               param_min[i])/param_step[i]));
+        if (i > 0) {
+            divisors.push_back(std::accumulate(nsteps.begin(), 
+                                               nsteps.end()-1, 1, std::multiplies<int>()));
+        }
     }
-
-    double n_sets = std::accumulate(nsteps.begin(), 
-                                 nsteps.end(), 1, std::multiplies<int>());
-    printf("%f\n", n_sets);
-   
+    int n_sets = std::accumulate(nsteps.begin(), 
+                                    nsteps.end(), 1, std::multiplies<int>());
+    printf("%d\n", n_sets);    
     // std::vector<int> nsteps = ones + (param_max - param_min)/param_step;
-    for (int j = 0; j < 2; j++) {
-        gNa += j*10;
-        //printf("%f\n", gNa);
-        gsl_odeiv2_system sys = {DiffEquations, jacobian, 9};
-        gsl_odeiv2_driver * d = 
-        gsl_odeiv2_driver_alloc_y_new (&sys,gsl_odeiv2_step_rk8pd,1e-6,1e-9,0.0);
-        t=0.0;
-        for (i = 0; i <= npoints; i++)
-            {
+    MPI_Init(&argc, &argv);
+    
+    int tid;
+    MPI_Comm_rank(MPI_COMM_WORLD, &tid);
+    
+    int nthreads;
+    MPI_Comm_size(MPI_COMM_WORLD, &nthreads);
+
+    for (int j = 0; j < n_sets; j++) {
+        if (j%nthreads == tid) {
+            gNa = param_min[0] + (j/divisors[0])%nsteps[0] * param_step[0];
+            gK =  param_min[1] + (j/divisors[1])%nsteps[1] * param_step[1];
+            gsl_odeiv2_system sys = {DiffEquations, jacobian, 9};
+            gsl_odeiv2_driver * d = 
+                gsl_odeiv2_driver_alloc_y_new (&sys,gsl_odeiv2_step_rk8pd,1e-6,1e-9,0.0);
+            t=0.0;
+            for (i = 0; i <= npoints; i++) {
                 double ti = i * t1 / npoints;
                 int status = gsl_odeiv2_driver_apply (d, &t, ti, y);
-
                 if (status != GSL_SUCCESS)
                     {
                         printf ("error, return value=%d\n", status);
                         break;
                     }
-
+                
                 //fprintf (fp,"%.5e\n", y[5]);
             }
-        gsl_odeiv2_driver_free (d);
-        
-    }    
-
+            gsl_odeiv2_driver_free (d);
+        }
+    }
+    MPI_Finalize();
     //fclose(fp);
     return 0;
 }
-
