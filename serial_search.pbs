@@ -1,0 +1,8 @@
+#!/bin/bash
+#PBS -N test_job
+#PBS -l walltime=00:05:00
+#PBS -j oe
+#PBS -l mppwidth=1024
+cd /lustre/beagle2/pmalonis/parameter_search
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH":/soft/gsl/gnu/1.15/lib/"
+aprun -n 1024 ./serial_search
