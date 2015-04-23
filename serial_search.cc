@@ -10,19 +10,24 @@
 #include <functional>
 #include <numeric>
 #include <mpi.h>
+#include <string.h>
+#include <assert.h>
 #include <gsl/gsl_interp.h>
 #include <gsl/gsl_errno.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_odeiv2.h>
 #define NCHANNELS 8
 
-std::vector<int> find_spikes(const double v[], const int n, const double threshold);
+std::vector<int> find_spikes(std::vector<double> v, const double threshold);
 
 double compare_subthreshold(const double x[], const double y[],const double threshold, 
                             const size_t n, const int max_offset);
 
-double max_xcorr(const double x[], const double y[], 
+double max_xcorr(const std::vector<double> x, const std::vector<double> y, 
                  const size_t n, const int max_offset);
+
+std::vector<double> spike_height(const std::vector<double> v);
+std::vector<int> spike_width(const std::vector<double> v);
 
 double sum_array(double* array,int n){
     int i;
@@ -44,8 +49,8 @@ double dot_prod(double* a, double* b, int n){
 
 //recorded data
 const double sr = 10; //samping rate in samples/ms
-double *current_recorded;
-double *time_recorded;
+std::vector<double> current_recorded;
+std::vector<double> time_recorded;
 
 //Nernest potentials in mv
 const double vNa=50; 
@@ -244,8 +249,8 @@ DiffEquations(double t, const double y[], double diff[], void *params)
     double iap;
     //int idx = t/.1;
     //    iap = current_recorded[idx];
-    iap = gsl_interp_eval(interpolation, time_recorded, 
-                          current_recorded, t, accelerator);
+    iap = gsl_interp_eval(interpolation, time_recorded.data(), 
+                          current_recorded.data(), t, accelerator);
     // try {
     //     iap = gsl_interp_eval(interpolation, time_recorded, 
     //                           current_recorded, t, accelerator);
@@ -640,40 +645,47 @@ int main(int argc, char** argv)
     std::string delim = "\t";
     //double current_recorded[nlines];
     //double voltage_recorded[nlines];
-    current_recorded = (double*) malloc((nlines)*sizeof(double));
-    double* voltage_recorded = (double*) malloc((nlines)*sizeof(double));
+    std::vector<double> voltage_recorded;
+    voltage_recorded.reserve(nlines);
+    current_recorded.reserve(nlines);
 
     if (myfile.is_open()) {
         while ( getline (myfile,line)) {
             std::string::size_type sz; 
             //int *ptr = NULL;
-            current_recorded[i] = std::stof(line.substr(0,line.find(delim)).c_str(), &sz);
-            voltage_recorded[i] = std::stof(line.substr(line.find(delim)+1, line.size()).c_str(), &sz);
-            i++;
+            current_recorded.push_back(std::stof(line.substr(0,
+                                                             line.find(delim)).c_str(), &sz));
+            voltage_recorded.push_back(std::stof(line.substr(line.find(delim)+1, 
+                                                             line.size()).c_str(), &sz));
+            // current_recorded[i] = std::stof(line.substr(0,line.find(delim)).c_str(), &sz);
+            // voltage_recorded[i] = std::stof(line.substr(line.find(delim)+1, line.size()).c_str(), &sz);
+            // i++;
         }
     }
     else std::cout << "Unable to open file";
     myfile.close();
 
     // getting recorded time
-    time_recorded = (double*) malloc((nlines)*sizeof(double));
+    //time_recorded = (double*) malloc((nlines)*sizeof(double));
+    time_recorded.reserve(nlines);
     for (i=0; i < nlines; i++) {
-        time_recorded[i] = i/sr;
+        time_recorded.push_back(i/sr);
     }
 
     // setting up integration parameters
-    double t = 0.0, t1 = time_recorded[nlines-1];
+    double t = 0.0;//, t1 = time_recorded[nlines-1];
     double y[9] = {n,h,rf,rs,ca,v,e,rT,hp};
-    int npoints = static_cast<int>(t1*sr);
-
+ 
     //setting up interpolation
     interpolation = gsl_interp_alloc (gsl_interp_linear,nlines);
-    gsl_interp_init(interpolation, time_recorded, current_recorded, nlines);
+    gsl_interp_init(interpolation, time_recorded.data(), 
+                    current_recorded.data(), nlines);
     accelerator =  gsl_interp_accel_alloc();
-
+    
     double param_min_array[] = {100, 7, 45, .1, 1};
     double param_max_array[] = {2000, 14, 80, 1, 5};
-    double param_step_array[] = {50, .1, 5, .1, .1};
+    double param_step_array[] = {10, .1, 1, .1, .1};
+
     int nparams = sizeof(param_min_array)/sizeof(double);
     std::vector<double> param_min (param_min_array, 
                                    param_min_array + nparams); 
@@ -700,6 +712,7 @@ int main(int argc, char** argv)
     int n_sets = std::accumulate(nsteps.begin(), 
                                     nsteps.end(), 1, std::multiplies<int>());
 
+
     MPI_Init(&argc, &argv);
     
     int tid;
@@ -708,67 +721,109 @@ int main(int argc, char** argv)
     int nthreads;
     MPI_Comm_size(MPI_COMM_WORLD, &nthreads);
     
+    MPI_File fh;
+    int status;
+    status = MPI_File_open(MPI_COMM_WORLD, "/lustre/beagle2/pmalonis/parameter_search/search.bin", 
+                           MPI_MODE_CREATE | MPI_MODE_RDWR, MPI_INFO_NULL, &fh);
+
+    int max_nspikes = 50;
+    int row_size = nparams + max_nspikes + 3; //number of entries in row of output
+                               //file_id (5 (number of parameters) +
+                               //20 (maximum number of spike times) + 
+                               //3 (number of other metrics)
+    std::vector<double> row_spikes;
+    std::vector<int> spike_widths;
+    std::vector<double> spike_heights;
+
+    int offset; //offset in output file
+    double * row_data = (double *) calloc(row_size*sizeof(double), sizeof(double));
+    double xcorr_win_begin = static_cast<int>(200.0 * sr / 1000.0); //begining of cross
+                                          //correlation comparison in ms
+    double mean_width, mean_height;
     gsl_odeiv2_system sys;
     gsl_odeiv2_driver * d;
-    double v[npoints];
-    
-    //std::ofstream output_file;
-    //std::ostringstream file_name; 
-    //file_name << "/lustre/beagle2/pmalonis/parameter_search/output_test_" << tid << ".txt";
-    //output_file.open(file_name.str());
-    if (tid == 0) {
-        //output_file << "gNa\tgK\tgL\tspikes\txcorr\n";
-        printf("gNa\tgK\tgL\tspikes\txcorr\n");
-    } //title row of output
+    std::vector<double> voltage_model;
+    voltage_model.reserve(nlines);    
     for (int j = 0; j < n_sets; j++) {
         if (j%nthreads == tid) {
-            //printf("%d\t%d\n",j,tid);
+            //initial conditions
+            v = -70.14; 
+            n = .0002;
+            ca = 0.103;
+            h = 0.01;
+            rf = 0.03;
+            rs = 0.03;
+            e  = 0.05;
+            rT = 0.01;
+            hp = 0.1;
+            y[0] = n;
+            y[1] = h;
+            y[2] = rf;
+            y[3] = rs;
+            y[4] = ca;
+            y[5] = v;
+            y[6] = e;
+            y[7] = rT;
+            y[8] = hp;
+
             gNa = param_min[0] + (j/divisors[0])%nsteps[0] * param_step[0];
-            gSK =  param_min[1] + (j/divisors[1])%nsteps[1] * param_step[1];
+            gSK = param_min[1] + (j/divisors[1])%nsteps[1] * param_step[1];
             gK =  param_min[2] + (j/divisors[2])%nsteps[2] * param_step[2];
-            gCaT = param_min[3] + (j/divisors[3])%nsteps[3] * param_step[3];
+            gT = param_min[3] + (j/divisors[3])%nsteps[3] * param_step[3];
             gH = param_min[4] + (j/divisors[4])%nsteps[4] * param_step[4];
-            //            output_file << gNa << "\t" << gK << "\t" << gL << "\t";
-            printf("%f\t%f\t%f\t", gNa, gK, gL);
+            
+            // writing parameters 
+            row_data[0] = gNa;
+            row_data[1] = gSK;
+            row_data[2] = gK;
+            row_data[3] = gT;
+            row_data[4] = gH;
             sys = {DiffEquations, jacobian, 9};
             d = gsl_odeiv2_driver_alloc_y_new (&sys,gsl_odeiv2_step_rk8pd,1e-6,1e-9,0.0);
             t=0.0;
-            for (i = 0; i <= npoints; i++) {
-                double ti = i /sr; //* t1 / npoints;
+            for (i = 0; i < nlines; i++) {
+                double ti = i /sr;
                 int status = gsl_odeiv2_driver_apply (d, &t, ti, y);
                 if (status != GSL_SUCCESS)
                     {
                         std::cout << "error, return value=" << status << "\n";
                         break;
                     }
-                v[i] = y[5];
+                voltage_model.push_back(y[5]);
             }
+
             //recording spikes
             double threshold = -20;
-            std::vector<int> spikes = find_spikes(v, npoints+1, threshold);
-            std::vector<int>::const_iterator it;
-            for (it = spikes.begin(); it != spikes.end(); it++){
-                //output_file << *it;
-                printf("%d", *it);
-                if (it != spikes.end()-1) {
-                    //output_file << ", ";
-                    printf(", "); 
-                }
-                else printf("\t");//output_file << "\t";
-            }
-            // comparing subthreshold activity
+            std::vector<int> spikes = find_spikes(voltage_model, threshold);
+            assert(spikes.size() < max_nspikes);
+            std::copy(spikes.begin(), spikes.end(), 
+                      row_data + nparams);
+            // max cross correlation (leaving out first 200ms)
             int max_offset = 10;
-            double cross_correlation = max_xcorr(v, voltage_recorded, 
-                                                 npoints, max_offset);
-            //output_file << cross_correlation << "\n";
-            printf("%f\n", cross_correlation);
-
+            std::vector<double> voltage_model_end(voltage_model.begin()+xcorr_win_begin, 
+                                                  voltage_model.end());
+            std::vector<double> voltage_recorded_end(voltage_recorded.begin()+xcorr_win_begin, 
+                                                     voltage_recorded.end());
+            double cross_correlation = max_xcorr(voltage_model_end, 
+                                                 voltage_recorded_end,
+                                                 nlines, max_offset);
+            row_data[nparams+max_nspikes] = cross_correlation;
+            spike_widths = spike_width(voltage_model);
+            spike_heights = spike_height(voltage_model);
+            mean_width = static_cast<double>(std::accumulate(spike_widths.begin(), 
+                                                             spike_widths.end(), 0))/spike_widths.size();
+            mean_height = std::accumulate(spike_heights.begin(), spike_heights.end(), 0.0)/spike_heights.size();
+            row_data[nparams+max_nspikes+1] = mean_width; 
+            row_data[nparams+max_nspikes+2] = mean_height;
+            //writing row
+            offset = j * row_size * sizeof(double);
+            status = MPI_File_write_at(fh, offset, row_data, row_size, 
+                                       MPI_DOUBLE_PRECISION, MPI_STATUS_IGNORE);   
             gsl_odeiv2_driver_free (d);
         }
     }
+    MPI_File_close(&fh);
     MPI_Finalize();
-    //output_file.close();
-    //fclose(fp);
+
     return 0;
 }
-
