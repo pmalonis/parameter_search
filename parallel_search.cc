@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <functional>
 #include <numeric>
-//#include <mpi.h>
+#include <mpi.h>
 #include <string.h>
 #include <assert.h>
 #include <time.h>
