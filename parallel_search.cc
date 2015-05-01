@@ -50,7 +50,6 @@ double dot_prod(double* a, double* b, int n){
     return result;
 }
 
-
 //recorded data
 const double sr = 10; //samping rate in samples/ms
 std::vector<double> current_recorded;
@@ -66,18 +65,18 @@ const double vH=-30;
 double gNa=450;
 double gK=70;
 double gL=2;
-double gCa=19;
+double gCa=20;
 double gNap=1;
 double gSK=8.5;
 double gH=4;
-double gA=0;
-double gT=2.65;
+double gA=10;
+double gT=2;
 
 //Capacitance
 const double C=50;
 
 //Time constants in ms
-const double tauNbar=6;
+const double tauNbar=10;
 const double tauHPbar=1000;
 const double tauE=20;
 const double tauH=1;
@@ -675,7 +674,7 @@ int main(int argc, char** argv)
     else std::cout << "Unable to open file";
     myfile.close();
 
-    const double threshold = -20; //threshold for detecting spikes
+    const double threshold = 0; //threshold for detecting spikes
     std::vector<int> spikes_recorded = find_spikes(voltage_recorded, threshold);
     double mean_width_recorded = spike_width(voltage_recorded);
     double mean_height_recorded = spike_height(voltage_recorded);
@@ -696,13 +695,13 @@ int main(int argc, char** argv)
                     current_recorded.data(), nlines);
     accelerator =  gsl_interp_accel_alloc();
     
-    // double param_min_array[] = {100, 7, 45, .1, 1};
+    // double param_min_array[] = {100, 7, 45, .1, 1}; 
     // double param_max_array[] = {2000, 14, 80, 1, 5};
-    // double param_step_array[] = {10, .1, 1, .1, .1};
+    // double param_step_array[] = {50, .2, 1, .1, .1};
 
     double param_min_array[] = {100, 7, 45, .1, 1};
-    double param_max_array[] = {100, 7, 80, 1, 5};
-    double param_step_array[] = {10, .1, 1, .1, .1};
+    double param_max_array[] = {2000, 14, 85, 1, 5};
+    double param_step_array[] = {100, 1, 10, .1, .1};
 
     int nparams = sizeof(param_min_array)/sizeof(double);
     std::vector<double> param_min (param_min_array, 
@@ -729,6 +728,9 @@ int main(int argc, char** argv)
     }
     int n_sets = std::accumulate(nsteps.begin(), 
                                     nsteps.end(), 1, std::multiplies<int>());
+    if (tid == 0){
+        printf("number of parameter sets: %d\n", n_sets);
+    }
     MPI_File fh;
     int status;
     status = MPI_File_open(MPI_COMM_WORLD, "/lustre/beagle2/pmalonis/parameter_search/search.bin", 
@@ -744,7 +746,7 @@ int main(int argc, char** argv)
     double * row_data = (double *) calloc(row_size*sizeof(double), sizeof(double));
     double xcorr_win_begin = static_cast<int>(200.0 * sr / 1000.0); //begining of cross
                                           //correlation comparison in ms
-    double dspike_cost_ms = 5; // victor-purpura spike cost in ms
+    double dspike_cost_ms = 20; // victor-purpura spike cost in ms
     double dspike_cost_samples = dspike_cost_ms * sr/1000.0;
     double mean_width_model, mean_height_model, cross_correlation, spike_distance;
     gsl_odeiv2_system sys;
@@ -754,10 +756,10 @@ int main(int argc, char** argv)
     time_t start_time = time(NULL);
     for (int j = 0; j < n_sets; j++) {
         if (j%nthreads == tid) {
-            if (j%1000==0) {
-                time_t current_time = time(NULL) - start_time;
-                printf("%d\t%d\n", j, current_time);
-            }
+            // if (j%1000==0) {
+            //     time_t current_time = time(NULL) - start_time;
+            //     printf("%d\t%d\n", j, current_time);
+            // }
             memset(row_data,0,row_size*sizeof(double));
             //initial conditions
             v = -70.14; 
@@ -808,6 +810,10 @@ int main(int argc, char** argv)
 
             //recording spikes
             std::vector<int> spikes_model = find_spikes(voltage_model, threshold);
+            if (spikes_model.size()>1000) {
+                printf("Too many spikes: %d\t%d\n", j, spikes_model.size());
+                continue;
+            }
             spike_distance = spkd(spikes_model, spikes_recorded, dspike_cost_samples);
 
             int max_offset = 10;
